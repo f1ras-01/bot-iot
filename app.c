@@ -25,9 +25,9 @@ volatile int speed = 250;  // Default 25% speed
 /* Temperature */
 volatile float temperature = 0.0f;
 
-/* ADC values storage */
+/* ADC values storage. The DMA writes each conversion straight into this
+ * array; no software channel index is needed. */
 volatile uint16_t adc_values[3] = {0, 0, 0};  // POT1, POT2, POT3
-volatile uint8_t  channel_index = 0;          // Current channel (0, 1, 2)
 volatile uint8_t  adc_ready = 0;              // Flag: All 3 values ready
 volatile uint8_t  adc_running = 0;            // 0 = stopped, 1 = running
 
@@ -38,9 +38,6 @@ volatile uint8_t dataReady = 0;
 
 /* ISR-to-mainloop event flags */
 volatile uint8_t button_event = 0;
-
-/* Motor command failsafe timestamp */
-volatile uint32_t last_cmd_time = 0;
 
 /* ============================================================================
  * SendADCValues - Format and send ADC values via UART
@@ -88,24 +85,11 @@ void EXTI0_IRQHandler(void)
     }
 }
 
-/* ============================================================================
- * ADC_IRQHandler - Store ADC conversion results
- * ==========================================================================*/
-void ADC_IRQHandler(void)
-{
-    if (ADC1->SR & (1 << 1))  // EOC flag
-    {
-        adc_values[channel_index] = ADC1->DR;  // Read DR (clears EOC)
-
-        channel_index++;
-
-        if (channel_index >= 3)
-        {
-            channel_index = 0;  // Reset for next cycle
-            adc_ready = 1;      // Set flag: data ready to send
-        }
-    }
-}
+/* ----------------------------------------------------------------------------
+ * NOTE: the ADC no longer uses a per-conversion interrupt. Results are moved
+ * by DMA2 Stream0; see DMA2_Stream0_IRQHandler() in adc.c, which sets
+ * adc_ready once the full 3-channel sweep has been delivered.
+ * --------------------------------------------------------------------------*/
 
 /* ============================================================================
  * USART2_IRQHandler - Receive Bluetooth commands

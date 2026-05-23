@@ -27,10 +27,4 @@
 /* ----- Bluetooth RX buffer ----- */
 #define RX_BUFFER_SIZE       50
 
-/* ----- Motor command failsafe -----
- * If no drive command is received within this many milliseconds, the main
- * loop stops the motors. Protects against a dropped Bluetooth link leaving
- * the robot running away. */
-#define MOTOR_CMD_TIMEOUT_MS 1000U
-
 #endif /* CONFIG_H */

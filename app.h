@@ -22,9 +22,8 @@ extern volatile int speed;                  /* PWM duty (0..999) */
 /* Temperature */
 extern volatile float temperature;
 
-/* ADC values storage */
+/* ADC values storage (filled by DMA) */
 extern volatile uint16_t adc_values[3];     /* POT1, POT2, POT3 */
-extern volatile uint8_t  channel_index;     /* Current channel (0,1,2) */
 extern volatile uint8_t  adc_ready;         /* Flag: all 3 values ready */
 extern volatile uint8_t  adc_running;       /* 0 = stopped, 1 = running */
 
@@ -37,12 +36,6 @@ extern volatile uint8_t dataReady;
 
 /* Set by the button ISR; main loop performs the ADC start/stop + messaging. */
 extern volatile uint8_t button_event;
-
-/* ----- Motor command failsafe ----- */
-
-/* Millis() timestamp of the last received drive command. The main loop stops
- * the motors if no command arrives within MOTOR_CMD_TIMEOUT_MS. */
-extern volatile uint32_t last_cmd_time;
 
 /* ----- Helpers ----- */
 

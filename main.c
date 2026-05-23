@@ -15,8 +15,9 @@
  *  - All I2C / sensor calls have timeouts, so a missing DS1621 cannot hang
  *    the boot sequence.
  *  - ISRs only set flags; UART printing happens here in the main loop.
- *  - A motor failsafe stops the motors if no drive command arrives within
- *    MOTOR_CMD_TIMEOUT_MS (protects against a dropped Bluetooth link).
+ *  - The ADC is fed by DMA: TIM2 triggers a 3-channel sweep and DMA2 Stream0
+ *    delivers the results, raising one interrupt per sweep instead of three.
+ *  - Motors run until an explicit Stop (S) command.
  *  - The independent watchdog (IWDG) resets the MCU if the loop ever stalls.
  * ============================================================================
  */
@@ -36,8 +37,8 @@
 #include "motor.h"
 #include "app.h"
 
-/* Tracks whether the robot is currently under a drive command, so the
- * failsafe only stops the motors once per timeout (not every loop). */
+/* Set when the motors are driving, cleared when stopped. Used so the Stop
+ * command and the watchdog-style reporting only act when relevant. */
 static uint8_t motors_active = 0;
 
 /* ----------------------------------------------------------------------------
@@ -48,10 +49,9 @@ static void StartADC(void)
 {
     if (!adc_running)
     {
-        channel_index = 0;   // Resume cleanly from channel 0
         adc_ready = 0;
         ADC_Enable();
-        TIM2_Start();
+        TIM2_Start();        // Each TIM2 trigger runs a full DMA-fed sweep
         adc_running = 1;
     }
 }
@@ -62,18 +62,17 @@ static void StopADC(void)
     {
         TIM2_Stop();
         adc_running = 0;
-        channel_index = 0;   // Don't leave the sequence half-finished
     }
 }
 
 /* ----------------------------------------------------------------------------
- * Drive - apply a motor direction and refresh the failsafe timestamp.
- * Centralizing this means every drive command resets the watchdog timer.
+ * Drive - apply a motor direction.
+ * Motors run until an explicit Stop command (S) is received; this matches a
+ * controller that sends one-shot commands rather than a continuous stream.
  * --------------------------------------------------------------------------*/
 static void Drive(int in1, int in2, int in3, int in4)
 {
     SetMotorDirection(in1, in2, in3, in4);
-    last_cmd_time = Millis();
     motors_active = 1;
 }
 
@@ -190,17 +189,6 @@ int main(void)
                     USART2_SendString("AUTO> Temp read failed\r\n");
                 }
             }
-        }
-
-        /* ----- Motor failsafe -----
-         * If the robot is driving and no command has arrived recently, stop.
-         * This catches a dropped Bluetooth link mid-drive. */
-        if (motors_active &&
-            (uint32_t)(Millis() - last_cmd_time) >= MOTOR_CMD_TIMEOUT_MS)
-        {
-            EmergencyStop();
-            motors_active = 0;
-            USART2_SendString("FAILSAFE> No command - motors stopped\r\n");
         }
 
         /* ----- Process a completed Bluetooth command ----- */
