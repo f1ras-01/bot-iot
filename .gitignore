@@ -1,0 +1,15 @@
+DebugConfig/
+Listing/
+Objects/
+RTE/
+1st-version/
+
+# IDE
+*.uvoptx
+*.uvprojx
+
+# zip files
+*.zip
+
+*.uvguix.firas
+*.map

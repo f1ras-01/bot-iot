@@ -1,0 +1,352 @@
+/*
+ * ============================================================================
+ * STM32 COMPLETE BLUETOOTH ROBOT SYSTEM
+ * ============================================================================
+ * Features:
+ *  - Motor control via Bluetooth (Forward/Backward/Left/Right)
+ *  - Temperature sensing (DS1621 via I2C)
+ *  - 3 Potentiometers (ADC readings on PA1, PA4, PA5)
+ *  - Button control (PA0) to start/stop ADC periodic readings
+ *  - Bluetooth communication (USART2)
+ *
+ * Robustness notes (vs. the original single-file version):
+ *  - SysTick provides a real 1 ms timebase; loop timing no longer relies on
+ *    calibration-dependent busy loops.
+ *  - All I2C / sensor calls have timeouts, so a missing DS1621 cannot hang
+ *    the boot sequence.
+ *  - ISRs only set flags; UART printing happens here in the main loop.
+ *  - A motor failsafe stops the motors if no drive command arrives within
+ *    MOTOR_CMD_TIMEOUT_MS (protects against a dropped Bluetooth link).
+ *  - The independent watchdog (IWDG) resets the MCU if the loop ever stalls.
+ * ============================================================================
+ */
+
+#include "stm32f4xx.h"
+#include <stdio.h>
+#include <string.h>
+
+#include "config.h"
+#include "system.h"
+#include "gpio.h"
+#include "adc.h"
+#include "timers.h"
+#include "i2c.h"
+#include "ds1621.h"
+#include "usart.h"
+#include "motor.h"
+#include "app.h"
+
+/* Tracks whether the robot is currently under a drive command, so the
+ * failsafe only stops the motors once per timeout (not every loop). */
+static uint8_t motors_active = 0;
+
+/* ----------------------------------------------------------------------------
+ * StartADC / StopADC - small helpers so the button handler and the
+ * START/STOP text commands share one implementation.
+ * --------------------------------------------------------------------------*/
+static void StartADC(void)
+{
+    if (!adc_running)
+    {
+        channel_index = 0;   // Resume cleanly from channel 0
+        adc_ready = 0;
+        ADC_Enable();
+        TIM2_Start();
+        adc_running = 1;
+    }
+}
+
+static void StopADC(void)
+{
+    if (adc_running)
+    {
+        TIM2_Stop();
+        adc_running = 0;
+        channel_index = 0;   // Don't leave the sequence half-finished
+    }
+}
+
+/* ----------------------------------------------------------------------------
+ * Drive - apply a motor direction and refresh the failsafe timestamp.
+ * Centralizing this means every drive command resets the watchdog timer.
+ * --------------------------------------------------------------------------*/
+static void Drive(int in1, int in2, int in3, int in4)
+{
+    SetMotorDirection(in1, in2, in3, in4);
+    last_cmd_time = Millis();
+    motors_active = 1;
+}
+
+/* ============================================================================
+ * MAIN FUNCTION
+ * ==========================================================================*/
+int main(void)
+{
+    char msg[80];
+
+    /* ----- Initialize all peripherals ----- */
+    HSE_Init();
+    SysTick_Init();          // 1 ms timebase, needed by DelayMs/Millis
+    GPIO_Init();
+    GPIO_EXTI_Config();
+    ADC_Config();
+    TIM2_Config();
+    TIM3_Init();
+    I2C1_Init();
+    USART2_Init();
+
+    /* DS1621 may be absent; this no longer hangs the boot if it is. */
+    int sensor_ok = (DS1621_Init() == DS1621_OK);
+
+    DelayMs(50);
+
+    /* ----- Startup banner ----- */
+    USART2_SendString("\r\n");
+    USART2_SendString("============================================\r\n");
+    USART2_SendString("  STM32 COMPLETE BLUETOOTH ROBOT SYSTEM    \r\n");
+    USART2_SendString("============================================\r\n");
+    USART2_SendString("HARDWARE:\r\n");
+    USART2_SendString("  PA0 - Button (Toggle ADC)\r\n");
+    USART2_SendString("  PA1,PA4,PA5 - Potentiometers 1-3\r\n");
+    USART2_SendString("  Motors on PA6,PA7,PB0,PB1\r\n");
+    USART2_SendString("  Temperature sensor on PB8,PB9\r\n\r\n");
+    USART2_SendString(sensor_ok ? "Temp sensor: OK\r\n"
+                                : "Temp sensor: NOT DETECTED\r\n");
+    USART2_SendString("COMMANDS:\r\n");
+    USART2_SendString("  F/B/L/R/S  - Motor control\r\n");
+    USART2_SendString("  LF/LB/RF/RB - Individual motors\r\n");
+    USART2_SendString("  0-9 - Speed | ? - Show speed\r\n");
+    USART2_SendString("  T - Temperature\r\n");
+    USART2_SendString("  A - Read ADC | START/STOP - ADC control\r\n");
+    USART2_SendString("  H - Help\r\n");
+    USART2_SendString("============================================\r\n\r\n");
+
+    sprintf(msg, "Speed: %d%%\r\n", (speed * 100) / 999);
+    USART2_SendString(msg);
+    USART2_SendString("Press PA0 button to start/stop ADC\r\n\r\n");
+
+    /* Start the watchdog only after init/banner are done, so a slow init
+     * cannot trigger a spurious reset. ~1.25 s timeout. */
+    IWDG_Start();
+
+    uint32_t last_temp_time = Millis();
+
+    /* ----- Main loop ----- */
+    while (1)
+    {
+        /* Kick the watchdog every iteration. If the loop ever stalls (e.g.
+         * an unforeseen hang), the MCU resets instead of freezing. */
+        IWDG_Refresh();
+
+        /* ----- Deferred button event (set by EXTI0 ISR) ----- */
+        if (button_event)
+        {
+            button_event = 0;
+
+            if (!adc_running)
+            {
+                StartADC();
+                USART2_SendString("\r\n>>> ADC STARTED <<<\r\n");
+            }
+            else
+            {
+                StopADC();
+                USART2_SendString("\r\n>>> ADC STOPPED <<<\r\n");
+            }
+
+            /* Time-based debounce: ignore further edges for a short window,
+             * without busy-waiting inside the ISR. */
+            DelayMs(50);
+            button_event = 0;   // Discard any bounce captured during the wait
+        }
+
+        /* ----- ADC results ready ----- */
+        if (adc_ready && adc_running)
+        {
+            adc_ready = 0;
+            SendADCValues();
+        }
+
+        /* ----- Periodic temperature reading (every 5 s, real time) ----- */
+        if ((uint32_t)(Millis() - last_temp_time) >= 5000U)
+        {
+            last_temp_time = Millis();
+
+            if (sensor_ok)
+            {
+                float t;
+                if (DS1621_ReadTemperature(&t) == DS1621_OK)
+                {
+                    temperature = t;
+                    /* Integer formatting: no %f dependency. */
+                    int whole = (int)t;
+                    int frac  = (int)((t - whole) * 10);
+                    if (frac < 0) frac = -frac;
+                    sprintf(msg, "AUTO> Temperature: %d.%d C\r\n", whole, frac);
+                    USART2_SendString(msg);
+                }
+                else
+                {
+                    USART2_SendString("AUTO> Temp read failed\r\n");
+                }
+            }
+        }
+
+        /* ----- Motor failsafe -----
+         * If the robot is driving and no command has arrived recently, stop.
+         * This catches a dropped Bluetooth link mid-drive. */
+        if (motors_active &&
+            (uint32_t)(Millis() - last_cmd_time) >= MOTOR_CMD_TIMEOUT_MS)
+        {
+            EmergencyStop();
+            motors_active = 0;
+            USART2_SendString("FAILSAFE> No command - motors stopped\r\n");
+        }
+
+        /* ----- Process a completed Bluetooth command ----- */
+        if (dataReady)
+        {
+            /* Copy the command out under a brief interrupt mask, then clear
+             * the buffer state atomically. This removes the race where a new
+             * byte arrives between memset() and bufferIndex=0. */
+            char cmd[RX_BUFFER_SIZE];
+            __disable_irq();
+            strncpy(cmd, rxBuffer, sizeof(cmd));
+            cmd[sizeof(cmd) - 1] = '\0';
+            bufferIndex = 0;
+            dataReady = 0;
+            rxBuffer[0] = '\0';
+            __enable_irq();
+
+            USART2_SendString("CMD> ");
+            USART2_SendString(cmd);
+            USART2_SendString("\r\n");
+
+            /* Motor control commands */
+            if (strcmp(cmd, "S") == 0 || strcmp(cmd, "s") == 0)
+            {
+                EmergencyStop();
+                motors_active = 0;
+            }
+            else if (strcmp(cmd, "F") == 0 || strcmp(cmd, "f") == 0)
+            {
+                USART2_SendString("Moving FORWARD\r\n");
+                Drive(1, 0, 1, 0);
+            }
+            else if (strcmp(cmd, "B") == 0 || strcmp(cmd, "b") == 0)
+            {
+                USART2_SendString("Moving BACKWARD\r\n");
+                Drive(0, 1, 0, 1);
+            }
+            else if (strcmp(cmd, "L") == 0 || strcmp(cmd, "l") == 0)
+            {
+                USART2_SendString("Turning LEFT\r\n");
+                Drive(0, 0, 1, 0);
+            }
+            else if (strcmp(cmd, "R") == 0 || strcmp(cmd, "r") == 0)
+            {
+                USART2_SendString("Turning RIGHT\r\n");
+                Drive(1, 0, 0, 0);
+            }
+            else if (strcmp(cmd, "LF") == 0 || strcmp(cmd, "lf") == 0)
+            {
+                USART2_SendString("LEFT motor FORWARD\r\n");
+                Drive(1, 0, 0, 0);
+            }
+            else if (strcmp(cmd, "LB") == 0 || strcmp(cmd, "lb") == 0)
+            {
+                USART2_SendString("LEFT motor BACKWARD\r\n");
+                Drive(0, 1, 0, 0);
+            }
+            else if (strcmp(cmd, "RF") == 0 || strcmp(cmd, "rf") == 0)
+            {
+                USART2_SendString("RIGHT motor FORWARD\r\n");
+                Drive(0, 0, 1, 0);
+            }
+            else if (strcmp(cmd, "RB") == 0 || strcmp(cmd, "rb") == 0)
+            {
+                USART2_SendString("RIGHT motor BACKWARD\r\n");
+                Drive(0, 0, 0, 1);
+            }
+            /* Temperature command */
+            else if (strcmp(cmd, "T") == 0 || strcmp(cmd, "t") == 0)
+            {
+                if (sensor_ok)
+                {
+                    float t;
+                    if (DS1621_ReadTemperature(&t) == DS1621_OK)
+                    {
+                        temperature = t;
+                        int whole = (int)t;
+                        int frac  = (int)((t - whole) * 10);
+                        if (frac < 0) frac = -frac;
+                        sprintf(msg, "Temperature: %d.%d C\r\n", whole, frac);
+                        USART2_SendString(msg);
+                    }
+                    else
+                    {
+                        USART2_SendString("Temp read failed\r\n");
+                    }
+                }
+                else
+                {
+                    USART2_SendString("Temp sensor not available\r\n");
+                }
+            }
+            /* ADC commands */
+            else if (strcmp(cmd, "A") == 0 || strcmp(cmd, "a") == 0)
+            {
+                SendADCValues();
+            }
+            else if (strcmp(cmd, "START") == 0)
+            {
+                if (!adc_running)
+                {
+                    StartADC();
+                    USART2_SendString("ADC Started\r\n");
+                }
+            }
+            else if (strcmp(cmd, "STOP") == 0)
+            {
+                if (adc_running)
+                {
+                    StopADC();
+                    USART2_SendString("ADC Stopped\r\n");
+                }
+            }
+            /* Speed control */
+            else if (cmd[0] >= '0' && cmd[0] <= '9' && cmd[1] == '\0')
+            {
+                int speedLevel = cmd[0] - '0';
+                speed = (speedLevel * 999) / 9;
+                sprintf(msg, "Speed: Level %d (%d%%)\r\n",
+                        speedLevel, (speed * 100) / 999);
+                USART2_SendString(msg);
+            }
+            else if (strcmp(cmd, "?") == 0)
+            {
+                sprintf(msg, "Speed: %d%% | ADC: %s\r\n",
+                        (speed * 100) / 999,
+                        adc_running ? "RUNNING" : "STOPPED");
+                USART2_SendString(msg);
+            }
+            /* Help */
+            else if (strcmp(cmd, "H") == 0 || strcmp(cmd, "h") == 0)
+            {
+                USART2_SendString("\r\nCommands:\r\n");
+                USART2_SendString("  Motors: F,B,L,R,S,LF,LB,RF,RB\r\n");
+                USART2_SendString("  Speed: 0-9, ?\r\n");
+                USART2_SendString("  Sensors: T, A, START, STOP\r\n");
+                USART2_SendString("  Help: H\r\n");
+            }
+            else
+            {
+                USART2_SendString("Unknown. Send 'H' for help.\r\n");
+            }
+        }
+
+        /* Short, real cooperative pause. The loop period is now bounded and
+         * the watchdog is refreshed every iteration above. */
+        DelayMs(1);
+    }
+}
