@@ -45,6 +45,12 @@ void GPIO_Init(void)
     GPIOB->AFR[0] &= ~((0xF << 0) | (0xF << 4));  // Clear AF bits
     GPIOB->AFR[0] |= (2 << 0) | (2 << 4);         // AF2 (TIM3)
 
+    // PB6, PB7 as alternate function (USART1 -> ESP32 link)
+    GPIOB->MODER &= ~((3 << 12) | (3 << 14));  // Clear bits
+    GPIOB->MODER |= (2 << 12) | (2 << 14);     // Alternate function
+    GPIOB->AFR[0] &= ~((0xF << 24) | (0xF << 28));  // Clear AF bits
+    GPIOB->AFR[0] |= (7 << 24) | (7 << 28);         // AF7 (USART1)
+
     // PB8, PB9 as alternate function (I2C1)
     GPIOB->MODER &= ~((3 << 16) | (3 << 18));  // Clear bits
     GPIOB->MODER |= (2 << 16) | (2 << 18);     // Alternate function

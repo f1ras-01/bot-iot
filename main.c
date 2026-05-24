@@ -35,6 +35,7 @@
 #include "ds1621.h"
 #include "usart.h"
 #include "motor.h"
+#include "esp32.h"
 #include "app.h"
 
 /* Set when the motors are driving, cleared when stopped. Used so the Stop
@@ -93,6 +94,7 @@ int main(void)
     TIM3_Init();
     I2C1_Init();
     USART2_Init();
+    ESP32_Init();            // USART1 link to the ESP32 WiFi co-processor
 
     /* DS1621 may be absent; this no longer hangs the boot if it is. */
     int sensor_ok = (DS1621_Init() == DS1621_OK);
@@ -129,6 +131,22 @@ int main(void)
     IWDG_Start();
 
     uint32_t last_temp_time = Millis();
+
+    /* ----- Server round-robin state machine -----
+     * Cycle:  ThingSpeak active (SERVER_SLOT_MS)
+     *      ->  rest (SERVER_REST_MS)
+     *      ->  MQTT active (SERVER_SLOT_MS)
+     *      ->  rest (SERVER_REST_MS)  ->  repeat.
+     * One #DATA frame is published per active slot (ThingSpeak's 15 s rate
+     * limit means a 30 s slot only fits one or two updates anyway). */
+    enum { PH_THINGSPEAK, PH_REST_AFTER_TS, PH_MQTT, PH_REST_AFTER_MQTT };
+    int      phase            = PH_THINGSPEAK;
+    uint32_t phase_start      = Millis();
+    uint8_t  published_in_slot = 0;
+
+    /* Open the first slot. */
+    ESP32_SelectServer(SERVER_THINGSPEAK);
+    USART2_SendString("CYCLE> ThingSpeak active\r\n");
 
     /* ----- Main loop ----- */
     while (1)
@@ -191,6 +209,65 @@ int main(void)
             }
         }
 
+        /* ----- Server round-robin -----
+         * Each active slot publishes one #DATA frame, then holds the
+         * connection open for the rest of the slot, then idles during rest. */
+        {
+            uint32_t in_phase = (uint32_t)(Millis() - phase_start);
+
+            switch (phase)
+            {
+            case PH_THINGSPEAK:
+            case PH_MQTT:
+                /* Publish once near the start of the slot. */
+                if (!published_in_slot)
+                {
+                    uint16_t p1 = adc_values[0];   /* snapshot (DMA-updated) */
+                    uint16_t p2 = adc_values[1];
+                    uint16_t p3 = adc_values[2];
+                    int16_t  temp_x10 = (int16_t)(temperature * 10.0f);
+
+                    ESP32_SendData(p1, p2, p3, temp_x10);
+                    published_in_slot = 1;
+                    USART2_SendString("ESP32> sensor frame sent\r\n");
+                }
+                /* Slot expired: close the server and enter the rest phase. */
+                if (in_phase >= SERVER_SLOT_MS)
+                {
+                    ESP32_SelectServer(SERVER_NONE);
+                    phase = (phase == PH_THINGSPEAK) ? PH_REST_AFTER_TS
+                                                     : PH_REST_AFTER_MQTT;
+                    phase_start = Millis();
+                    USART2_SendString("CYCLE> server closed, resting\r\n");
+                }
+                break;
+
+            case PH_REST_AFTER_TS:
+                /* Rest done: open the MQTT slot. */
+                if (in_phase >= SERVER_REST_MS)
+                {
+                    ESP32_SelectServer(SERVER_MQTT);
+                    phase = PH_MQTT;
+                    phase_start = Millis();
+                    published_in_slot = 0;
+                    USART2_SendString("CYCLE> MQTT active\r\n");
+                }
+                break;
+
+            case PH_REST_AFTER_MQTT:
+                /* Rest done: start the cycle over with ThingSpeak. */
+                if (in_phase >= SERVER_REST_MS)
+                {
+                    ESP32_SelectServer(SERVER_THINGSPEAK);
+                    phase = PH_THINGSPEAK;
+                    phase_start = Millis();
+                    published_in_slot = 0;
+                    USART2_SendString("CYCLE> ThingSpeak active\r\n");
+                }
+                break;
+            }
+        }
+
         /* ----- Process a completed Bluetooth command ----- */
         if (dataReady)
         {
@@ -210,8 +287,34 @@ int main(void)
             USART2_SendString(cmd);
             USART2_SendString("\r\n");
 
+            /* WiFi credentials: "WIFI:<ssid>;<password>"
+             * Forwarded to the ESP32, which stores them in its flash. */
+            if (strncmp(cmd, "WIFI:", 5) == 0)
+            {
+                char *sep = strchr(cmd + 5, ';');
+                if (sep != NULL)
+                {
+                    *sep = '\0';                 /* split ssid / password */
+                    const char *ssid = cmd + 5;
+                    const char *pass = sep + 1;
+
+                    if (ssid[0] == '\0')
+                    {
+                        USART2_SendString("WIFI: empty SSID\r\n");
+                    }
+                    else
+                    {
+                        ESP32_SendWiFiCreds(ssid, pass);
+                        USART2_SendString("WIFI: credentials sent to ESP32\r\n");
+                    }
+                }
+                else
+                {
+                    USART2_SendString("WIFI: bad format, use WIFI:ssid;pass\r\n");
+                }
+            }
             /* Motor control commands */
-            if (strcmp(cmd, "S") == 0 || strcmp(cmd, "s") == 0)
+            else if (strcmp(cmd, "S") == 0 || strcmp(cmd, "s") == 0)
             {
                 EmergencyStop();
                 motors_active = 0;
@@ -325,6 +428,7 @@ int main(void)
                 USART2_SendString("  Motors: F,B,L,R,S,LF,LB,RF,RB\r\n");
                 USART2_SendString("  Speed: 0-9, ?\r\n");
                 USART2_SendString("  Sensors: T, A, START, STOP\r\n");
+                USART2_SendString("  WiFi: WIFI:ssid;password\r\n");
                 USART2_SendString("  Help: H\r\n");
             }
             else
