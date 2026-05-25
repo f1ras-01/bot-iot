@@ -28,5 +28,5 @@ void EmergencyStop(void)
     TIM3->CCR2 = 0;
     TIM3->CCR3 = 0;
     TIM3->CCR4 = 0;
-    USART2_SendString("\r\n>>> EMERGENCY STOP <<<\r\n");
+    BT_SendString("\r\n>>> EMERGENCY STOP <<<\r\n");
 }

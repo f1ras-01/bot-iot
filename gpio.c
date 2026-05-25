@@ -25,7 +25,7 @@ void GPIO_Init(void)
     GPIOA->MODER &= ~((3 << 2) | (3 << 8) | (3 << 10));  // Clear bits
     GPIOA->MODER |= (3 << 2) | (3 << 8) | (3 << 10);     // Analog mode
 
-    // PA2, PA3 as alternate function (USART2)
+    // PA2, PA3 as alternate function (USART2 -> ESP-AT WiFi modem)
     GPIOA->MODER &= ~((3 << 4) | (3 << 6));  // Clear bits
     GPIOA->MODER |= (2 << 4) | (2 << 6);     // Alternate function
     GPIOA->AFR[0] &= ~((0xF << 8) | (0xF << 12));  // Clear AF bits
@@ -37,6 +37,12 @@ void GPIO_Init(void)
     GPIOA->AFR[0] &= ~((0xF << 24) | (0xF << 28));  // Clear AF bits
     GPIOA->AFR[0] |= (2 << 24) | (2 << 28);         // AF2 (TIM3)
 
+    // PA9, PA10 as alternate function (USART1 -> Bluetooth HC-06)
+    GPIOA->MODER &= ~((3 << 18) | (3 << 20));  // Clear bits
+    GPIOA->MODER |= (2 << 18) | (2 << 20);     // Alternate function
+    GPIOA->AFR[1] &= ~((0xF << 4) | (0xF << 8));   // Clear AF bits (PA9,PA10)
+    GPIOA->AFR[1] |= (7 << 4) | (7 << 8);          // AF7 (USART1)
+
     // ===== GPIOB Configuration =====
 
     // PB0, PB1 as alternate function (TIM3_CH3, TIM3_CH4)
@@ -44,12 +50,6 @@ void GPIO_Init(void)
     GPIOB->MODER |= (2 << 0) | (2 << 2);     // Alternate function
     GPIOB->AFR[0] &= ~((0xF << 0) | (0xF << 4));  // Clear AF bits
     GPIOB->AFR[0] |= (2 << 0) | (2 << 4);         // AF2 (TIM3)
-
-    // PB6, PB7 as alternate function (USART1 -> ESP32 link)
-    GPIOB->MODER &= ~((3 << 12) | (3 << 14));  // Clear bits
-    GPIOB->MODER |= (2 << 12) | (2 << 14);     // Alternate function
-    GPIOB->AFR[0] &= ~((0xF << 24) | (0xF << 28));  // Clear AF bits
-    GPIOB->AFR[0] |= (7 << 24) | (7 << 28);         // AF7 (USART1)
 
     // PB8, PB9 as alternate function (I2C1)
     GPIOB->MODER &= ~((3 << 16) | (3 << 18));  // Clear bits

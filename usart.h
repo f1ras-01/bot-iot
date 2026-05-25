@@ -1,7 +1,11 @@
 /*
  * usart.h
  * ----------------------------------------------------------------------------
- * USART2 driver for Bluetooth communication (9600 baud, PA2/PA3).
+ * Bluetooth (HC-06) driver - USART1, PA9 = TX, PA10 = RX, 9600 baud.
+ *
+ * Carries motor commands in and debug/status text out. The public API is
+ * named BT_* (Bluetooth) so it reflects purpose, not the USART number -
+ * the ESP-AT WiFi modem uses a separate UART (USART2, see esp32.h).
  * ----------------------------------------------------------------------------
  */
 #ifndef USART_H
@@ -9,9 +13,9 @@
 
 #include "stm32f4xx.h"
 
-void USART2_Init(void);
-void USART2_SendChar(char c);
-void USART2_SendString(char *str);
-void USART2_SendNumber(uint16_t num);
+void BT_Init(void);
+void BT_SendChar(char c);
+void BT_SendString(char *str);
+void BT_SendNumber(uint16_t num);
 
 #endif /* USART_H */

@@ -1,137 +1,252 @@
 /*
  * esp32.c
  * ----------------------------------------------------------------------------
- * USART1 link to the ESP32 WiFi co-processor (PB6=TX, PB7=RX, 115200 baud).
+ * Driver for an ESP32 running ESP-AT firmware (WiFi modem over UART).
  *
- * USART1 is on APB2. In this project APB2 is clocked from the 8 MHz HSE, so
- * the baud-rate divisor is 8 MHz / 115200.
+ * USART2, PA2=TX, PA3=RX, 115200 baud. RX is interrupt-driven into a ring
+ * buffer. The AT engine sends a command string and then scans the incoming
+ * bytes for an expected token (e.g. "OK"), bounded by a SysTick timeout.
  *
- * This driver is transmit-only for now (STM32 -> ESP32). RX is initialized so
- * the link can be made bidirectional later (e.g. ESP32 status replies).
+ * ESP-AT command flow for one ThingSpeak update:
+ *   AT                                          -> OK
+ *   AT+CWMODE=1                                 -> OK
+ *   AT+CWJAP="ssid","pass"                      -> OK   (slow: up to ~20 s)
+ *   AT+CIPSTART="TCP","api.thingspeak.com",80   -> OK
+ *   AT+CIPSEND=<len>                            -> ">"
+ *   <HTTP request bytes>                        -> SEND OK
+ *   AT+CIPCLOSE                                 -> OK
  * ----------------------------------------------------------------------------
  */
 #include "esp32.h"
+#include "system.h"     /* Millis() for timeouts */
+#include <string.h>
+#include <stdio.h>
+
+/* ----- RX ring buffer (filled by USART2_IRQHandler) ----- */
+#define RX_RING_SIZE 512
+static volatile char     rxRing[RX_RING_SIZE];
+static volatile uint16_t rxHead = 0;   /* written by ISR  */
+static volatile uint16_t rxTail = 0;   /* read by main    */
+
+/* ThingSpeak endpoint. Plain HTTP keeps the AT sequence simple. */
+#define TS_HOST "api.thingspeak.com"
+#define TS_PORT 80
 
 /* ============================================================================
- * ESP32_Init - Initialize USART1
+ * ESP32_Init - Initialize USART1 with an RX interrupt
  * ==========================================================================*/
 void ESP32_Init(void)
 {
-    // Enable USART1 clock (APB2)
-    RCC->APB2ENR |= (1 << 4);  // USART1EN
+    RCC->APB1ENR |= (1 << 17);  // USART2EN (APB1)
 
-    // Baud rate: 115200 @ 8 MHz APB2
-    // BRR = 8,000,000 / 115200 = 69.44 -> 69 (error ~0.6%, well within tolerance)
-    USART1->BRR = 69;
+    // 115200 @ 16 MHz APB1: BRR = 16e6 / 115200 = 139 -> 0x8B
+    USART2->BRR = 139;
 
-    // Enable USART1: transmitter, receiver, USART itself
-    USART1->CR1 |= (1 << 13);  // UE: USART enable
-    USART1->CR1 |= (1 << 3);   // TE: transmitter enable
-    USART1->CR1 |= (1 << 2);   // RE: receiver enable
+    USART2->CR1 |= (1 << 13);   // UE: USART enable
+    USART2->CR1 |= (1 << 5);    // RXNEIE: RX-not-empty interrupt enable
+    USART2->CR1 |= (1 << 3);    // TE: transmitter enable
+    USART2->CR1 |= (1 << 2);    // RE: receiver enable
+
+    NVIC_SetPriority(USART2_IRQn, 1);
+    NVIC_EnableIRQ(USART2_IRQn);
 }
 
 /* ============================================================================
- * ESP32_SendChar - Transmit one character
+ * USART2_IRQHandler - store each received byte into the ring buffer
  * ==========================================================================*/
-void ESP32_SendChar(char c)
+void USART2_IRQHandler(void)
 {
-    while (!(USART1->SR & (1 << 7)));  // Wait for TXE
-    USART1->DR = (uint8_t)c;
-}
-
-/* ============================================================================
- * ESP32_SendString - Transmit a null-terminated string
- * ==========================================================================*/
-void ESP32_SendString(const char *str)
-{
-    while (*str)
-        ESP32_SendChar(*str++);
-    while (!(USART1->SR & (1 << 6)));  // Wait for TC (transmission complete)
+    if (USART2->SR & (1 << 5))   // RXNE
+    {
+        char c = (char)USART2->DR;        // reading DR clears RXNE
+        uint16_t next = (rxHead + 1) % RX_RING_SIZE;
+        if (next != rxTail)               // drop byte if buffer full
+        {
+            rxRing[rxHead] = c;
+            rxHead = next;
+        }
+    }
 }
 
 /* ----------------------------------------------------------------------------
- * SendUint - append an unsigned integer in decimal (helper, no printf).
+ * rxClear - discard anything currently in the ring buffer.
  * --------------------------------------------------------------------------*/
-static void SendUint(uint32_t v)
+static void rxClear(void)
 {
-    char buf[11];   // enough for 32-bit
-    int i = 0;
+    rxTail = rxHead;
+}
 
-    if (v == 0)
+/* ----------------------------------------------------------------------------
+ * Low-level transmit helpers.
+ * --------------------------------------------------------------------------*/
+static void txChar(char c)
+{
+    while (!(USART2->SR & (1 << 7)));   // wait TXE
+    USART2->DR = (uint8_t)c;
+}
+
+static void txString(const char *s)
+{
+    while (*s)
+        txChar(*s++);
+}
+
+/* ----------------------------------------------------------------------------
+ * WaitFor - scan incoming bytes until `token` is seen, or `fail` is seen,
+ * or `timeout_ms` elapses.
+ *   returns ESP_OK   if token found
+ *   returns ESP_FAIL if the fail string or a timeout occurs
+ * A small sliding window holds the most recent bytes for substring matching.
+ * --------------------------------------------------------------------------*/
+static int WaitFor(const char *token, const char *fail, uint32_t timeout_ms)
+{
+    char    window[24];
+    uint8_t wlen = 0;
+    uint32_t start = Millis();
+
+    size_t flen = (fail != NULL) ? strlen(fail) : 0;
+
+    while ((uint32_t)(Millis() - start) < timeout_ms)
     {
-        ESP32_SendChar('0');
-        return;
+        /* AT+CWJAP can take ~20 s, far longer than the IWDG period. Refresh
+         * the watchdog here so a long-but-healthy AT operation is not
+         * mistaken for a hang. */
+        IWDG_Refresh();
+
+        // Pull all currently-available bytes from the ring.
+        while (rxTail != rxHead)
+        {
+            char c = rxRing[rxTail];
+            rxTail = (rxTail + 1) % RX_RING_SIZE;
+
+            // Append to the sliding window (shift out the oldest if full).
+            if (wlen < sizeof(window) - 1)
+            {
+                window[wlen++] = c;
+            }
+            else
+            {
+                memmove(window, window + 1, sizeof(window) - 2);
+                window[sizeof(window) - 2] = c;
+            }
+            window[wlen] = '\0';
+
+            if (strstr(window, token) != NULL)
+                return ESP_OK;
+            if (flen && strstr(window, fail) != NULL)
+                return ESP_FAIL;
+        }
     }
-    while (v > 0)
-    {
-        buf[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (i > 0)
-        ESP32_SendChar(buf[--i]);
+    return ESP_FAIL;   // timeout
+}
+
+/* ----------------------------------------------------------------------------
+ * SendCommand - send "<cmd>\r\n" then wait for the expected reply.
+ * --------------------------------------------------------------------------*/
+static int SendCommand(const char *cmd, const char *token, uint32_t timeout_ms)
+{
+    rxClear();
+    txString(cmd);
+    txString("\r\n");
+    return WaitFor(token, "ERROR", timeout_ms);
 }
 
 /* ============================================================================
- * ESP32_SelectServer - tell the ESP32 which server to publish to
+ * ESP32_Ping - "AT" -> "OK"
  * ==========================================================================*/
-void ESP32_SelectServer(esp_server_t server)
+int ESP32_Ping(void)
 {
-    switch (server)
-    {
-        case SERVER_THINGSPEAK:
-            ESP32_SendString("#SERVER,THINGSPEAK\n");
-            break;
-        case SERVER_MQTT:
-            ESP32_SendString("#SERVER,MQTT\n");
-            break;
-        case SERVER_NONE:
-        default:
-            ESP32_SendString("#SERVER,NONE\n");
-            break;
-    }
+    return SendCommand("AT", "OK", 1000);
 }
 
 /* ============================================================================
- * ESP32_SendWiFiCreds - forward WiFi credentials to the ESP32
+ * ESP32_WiFiConnect - station mode + join an access point
+ * ==========================================================================*/
+int ESP32_WiFiConnect(const char *ssid, const char *password)
+{
+    char cmd[128];
+
+    /* Reset the module first to clear any stale connection state, then give
+     * the ESP-AT firmware time to reboot before the next command. */
+    SendCommand("AT+RST", "ready", 5000);
+    DelayMs(2000);
+
+    if (SendCommand("AT", "OK", 1000) != ESP_OK)
+        return ESP_FAIL;
+
+    if (SendCommand("AT+CWMODE=1", "OK", 2000) != ESP_OK)
+        return ESP_FAIL;
+
+    // AT+CWJAP="ssid","password"  - joining can take many seconds.
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
+    if (SendCommand(cmd, "OK", 20000) != ESP_OK)
+        return ESP_FAIL;
+
+    return ESP_OK;
+}
+
+/* ============================================================================
+ * ESP32_WiFiDisconnect - leave the access point
+ * ==========================================================================*/
+void ESP32_WiFiDisconnect(void)
+{
+    SendCommand("AT+CWQAP", "OK", 2000);
+}
+
+/* ============================================================================
+ * ESP32_ThingSpeakPublish - open TCP, send an HTTP GET, close
  * ----------------------------------------------------------------------------
- * The ESP32 stores these in its own flash, so credentials only need to be
- * sent once per network. ssid/password must not contain ',' or '\n'.
+ * temp_x10 is tenths of a degree; it is formatted as a decimal with integer
+ * math so no floating-point printf is needed.
  * ==========================================================================*/
-void ESP32_SendWiFiCreds(const char *ssid, const char *password)
+int ESP32_ThingSpeakPublish(const char *api_key,
+                            uint16_t pot1, uint16_t pot2, uint16_t pot3,
+                            int16_t temp_x10)
 {
-    ESP32_SendString("#WIFI,");
-    ESP32_SendString(ssid);
-    ESP32_SendChar(',');
-    ESP32_SendString(password);
-    ESP32_SendChar('\n');
-}
+    char cmd[96];
+    char http[256];
+    char tempStr[12];
+    int  len;
 
-/* ============================================================================
- * ESP32_SendData - send one sensor frame
- * ----------------------------------------------------------------------------
- * Format: #DATA,<pot1>,<pot2>,<pot3>,<temp_x10>\n
- * temp_x10 may be negative; a leading '-' is emitted if so.
- * ==========================================================================*/
-void ESP32_SendData(uint16_t pot1, uint16_t pot2, uint16_t pot3,
-                    int16_t temp_x10)
-{
-    ESP32_SendString("#DATA,");
-    SendUint(pot1);
-    ESP32_SendChar(',');
-    SendUint(pot2);
-    ESP32_SendChar(',');
-    SendUint(pot3);
-    ESP32_SendChar(',');
+    /* Format temperature: sign + whole.frac */
+    int16_t t = temp_x10;
+    const char *sign = "";
+    if (t < 0) { sign = "-"; t = (int16_t)(-t); }
+    snprintf(tempStr, sizeof(tempStr), "%s%d.%d", sign, t / 10, t % 10);
 
-    if (temp_x10 < 0)
+    /* Open a TCP connection to ThingSpeak. */
+    snprintf(cmd, sizeof(cmd),
+             "AT+CIPSTART=\"TCP\",\"%s\",%d", TS_HOST, TS_PORT);
+    if (SendCommand(cmd, "OK", 8000) != ESP_OK)
+        return ESP_FAIL;
+
+    /* Build the HTTP GET request. ThingSpeak fields: 1..3 = pots, 4 = temp. */
+    len = snprintf(http, sizeof(http),
+        "GET /update?api_key=%s&field1=%u&field2=%u&field3=%u&field4=%s "
+        "HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        api_key, pot1, pot2, pot3, tempStr, TS_HOST);
+
+    /* Tell ESP-AT how many bytes follow, then wait for the '>' prompt. */
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d", len);
+    if (SendCommand(cmd, ">", 4000) != ESP_OK)
     {
-        ESP32_SendChar('-');
-        SendUint((uint32_t)(-temp_x10));
-    }
-    else
-    {
-        SendUint((uint32_t)temp_x10);
+        SendCommand("AT+CIPCLOSE", "OK", 2000);
+        return ESP_FAIL;
     }
 
-    ESP32_SendChar('\n');
+    /* Send the raw HTTP request; ESP-AT replies "SEND OK" once transmitted. */
+    rxClear();
+    txString(http);
+    if (WaitFor("SEND OK", "ERROR", 6000) != ESP_OK)
+    {
+        SendCommand("AT+CIPCLOSE", "OK", 2000);
+        return ESP_FAIL;
+    }
+
+    /* Give the server a moment to reply, then close. We do not parse the
+     * HTTP response body; reaching SEND OK means the request went out. */
+    DelayMs(1500);
+    SendCommand("AT+CIPCLOSE", "OK", 2000);
+
+    return ESP_OK;
 }

@@ -38,10 +38,11 @@ void I2C1_Init(void)
     I2C1->CR1 |= (1 << 15);     // SWRST
     I2C1->CR1 &= ~(1 << 15);    // Clear SWRST
 
-    // Configure I2C for 8 MHz APB1 clock
-    I2C1->CR2 = 8;              // FREQ = 8 MHz
-    I2C1->CCR = 40;             // Standard mode, 100 kHz
-    I2C1->TRISE = 9;            // Rise time
+    // Configure I2C timing for a 16 MHz APB1 clock (100 kHz standard mode).
+    // FREQ = APB1 in MHz; CCR = APB1 / (2 * 100kHz); TRISE = APB1(MHz) + 1.
+    I2C1->CR2   = 16;           // FREQ = 16 MHz
+    I2C1->CCR   = 0x50;         // 80 -> 100 kHz standard mode
+    I2C1->TRISE = 17;           // Rise time (16 + 1)
 
     // Enable I2C1
     I2C1->CR1 |= (1 << 0);      // PE = 1

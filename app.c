@@ -55,18 +55,18 @@ void SendADCValues(void)
     uint16_t v1 = adc_values[1];
     uint16_t v2 = adc_values[2];
 
-    USART2_SendString("\r\n===== ADC READINGS =====\r\n");
+    BT_SendString("\r\n===== ADC READINGS =====\r\n");
 
     sprintf(msg, "POT1 (PA1): %u (%u mV)\r\n", v0, (unsigned)((v0 * 3300U) / 4095U));
-    USART2_SendString(msg);
+    BT_SendString(msg);
 
     sprintf(msg, "POT2 (PA4): %u (%u mV)\r\n", v1, (unsigned)((v1 * 3300U) / 4095U));
-    USART2_SendString(msg);
+    BT_SendString(msg);
 
     sprintf(msg, "POT3 (PA5): %u (%u mV)\r\n", v2, (unsigned)((v2 * 3300U) / 4095U));
-    USART2_SendString(msg);
+    BT_SendString(msg);
 
-    USART2_SendString("========================\r\n");
+    BT_SendString("========================\r\n");
 }
 
 /* ============================================================================
@@ -92,17 +92,17 @@ void EXTI0_IRQHandler(void)
  * --------------------------------------------------------------------------*/
 
 /* ============================================================================
- * USART2_IRQHandler - Receive Bluetooth commands
+ * USART1_IRQHandler - Receive Bluetooth commands
  * ----------------------------------------------------------------------------
  * Still flag-only: bytes are buffered, and an idle line raises dataReady.
  * No processing is done here.
  * ==========================================================================*/
-void USART2_IRQHandler(void)
+void USART1_IRQHandler(void)
 {
     // RXNE: Receive data register not empty
-    if (USART2->SR & (1 << 5))
+    if (USART1->SR & (1 << 5))
     {
-        char c = (char)USART2->DR;
+        char c = (char)USART1->DR;
 
         // Ignore newline/carriage return
         if (c == '\n' || c == '\r')
@@ -114,10 +114,10 @@ void USART2_IRQHandler(void)
     }
 
     // IDLE: Idle line detected (end of transmission)
-    if (USART2->SR & (1 << 4))
+    if (USART1->SR & (1 << 4))
     {
-        volatile uint32_t tmp = USART2->SR;
-        tmp = USART2->DR;
+        volatile uint32_t tmp = USART1->SR;
+        tmp = USART1->DR;
         (void)tmp;  // Clear IDLE flag
 
         rxBuffer[bufferIndex] = '\0';  // Null-terminate

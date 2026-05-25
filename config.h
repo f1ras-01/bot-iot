@@ -25,16 +25,15 @@
 #define DS1621_READ_TEMP     0xAA
 
 /* ----- Bluetooth RX buffer -----
- * Must fit the longest command. The WIFI: credential command can be
- * "WIFI:" + 32-char SSID + ";" + 63-char password + terminator. */
+ * Holds one incoming command line (motor commands, STATUS, etc.). */
 #define RX_BUFFER_SIZE       110
 
-/* ----- ESP32 / cloud publishing -----
- * The STM32 runs a round-robin between the two servers:
- *   ThingSpeak active -> close -> rest -> MQTT active -> close -> rest -> ...
- * ThingSpeak free accounts accept at most one update per 15 s, so only one
- * publish is sent inside a ThingSpeak slot. */
-#define SERVER_SLOT_MS       30000U   /* how long each server stays active   */
-#define SERVER_REST_MS        2000U   /* idle gap between the two servers    */
+/* ----- ThingSpeak (via ESP-AT WiFi modem) -----
+ * Free accounts accept at most one update per 15 s; keep a margin.
+ * Edit WIFI_SSID / WIFI_PASS when changing networks, then rebuild. */
+#define TS_INTERVAL_MS       16000U
+#define WIFI_SSID            "Galaxy A25 5G 2072"
+#define WIFI_PASS            "wifi2024"
+#define THINGSPEAK_API_KEY   "Q3SNAAFC3I3LQMBR"
 
 #endif /* CONFIG_H */

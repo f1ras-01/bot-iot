@@ -1,27 +1,31 @@
 /*
  * system.c
  * ----------------------------------------------------------------------------
- * System clock (HSE), SysTick millisecond timebase, watchdog, and delays.
+ * System clock, SysTick millisecond timebase, watchdog, and delays.
+ *
+ * The MCU runs on its default internal 16 MHz HSI oscillator - no clock
+ * switching is performed (matching the proven hardware setup). Every clock-
+ * derived value in the project (SysTick, UART baud, timers, I2C) is sized
+ * for a 16 MHz core / APB clock.
  * ----------------------------------------------------------------------------
  */
 #include "system.h"
 
-/* Core clock after HSE_Init(): external crystal = 8 MHz */
-#define SYSTEM_CLOCK_HZ   8000000UL
+/* Core / APB clock: the STM32F407 powers up on the 16 MHz HSI and we keep it. */
+#define SYSTEM_CLOCK_HZ   16000000UL
 
 /* Millisecond counter, incremented by the SysTick interrupt */
 static volatile uint32_t g_millis = 0;
 
 /* ============================================================================
- * HSE_Init - Initialize external 8 MHz oscillator
+ * Clock_Init - the MCU already runs on the 16 MHz HSI at reset.
+ * ----------------------------------------------------------------------------
+ * Kept as an explicit no-op so main() reads clearly and so a real clock
+ * setup can be dropped in here later without changing call sites.
  * ==========================================================================*/
-void HSE_Init(void)
+void Clock_Init(void)
 {
-    RCC->CR |= (1 << 16);               // Enable HSE
-    while (!(RCC->CR & (1 << 17)));     // Wait for HSE ready
-    RCC->CFGR &= ~(3 << 0);             // Clear SW bits
-    RCC->CFGR |= (1 << 0);              // Select HSE as system clock
-    while ((RCC->CFGR & (3 << 2)) != (1 << 2));  // Wait for HSE to be used
+    /* Default reset state = HSI 16 MHz selected as system clock. Nothing to do. */
 }
 
 /* ============================================================================

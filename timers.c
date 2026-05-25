@@ -20,9 +20,9 @@ void TIM2_Config(void)
     TIM2->CR1 = 0;
     TIM2->CR2 = 0;
 
-    // Configure prescaler and auto-reload for 8 MHz HSE
-    // Timer frequency = 8 MHz / (PSC + 1) = 8 MHz / 8000 = 1 kHz
-    TIM2->PSC = 7999;  // Prescaler: 8000-1
+    // Configure prescaler and auto-reload for a 16 MHz timer clock
+    // Timer frequency = 16 MHz / (PSC + 1) = 16 MHz / 16000 = 1 kHz
+    TIM2->PSC = 15999;  // Prescaler: 16000-1
 
     // Auto-reload value: 1 kHz / 333 = ~3 Hz (333ms per trigger)
     TIM2->ARR = 332;  // 333ms period
@@ -70,9 +70,9 @@ void TIM3_Init(void)
     TIM3->CR1 = 0;
     TIM3->CR2 = 0;
 
-    // Configure prescaler and auto-reload for 8 MHz HSE
-    // PWM frequency = 8 MHz / ((PSC+1) * (ARR+1)) = 8 MHz / (20 * 1000) = 400 Hz
-    TIM3->PSC = 19;   // Prescaler: 20-1
+    // Configure prescaler and auto-reload for a 16 MHz timer clock
+    // PWM frequency = 16 MHz / ((PSC+1) * (ARR+1)) = 16 MHz / (40 * 1000) = 400 Hz
+    TIM3->PSC = 39;   // Prescaler: 40-1
     TIM3->ARR = 999;  // Auto-reload: 1000-1
 
     // Configure PWM mode for all 4 channels

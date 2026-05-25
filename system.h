@@ -1,7 +1,8 @@
 /*
  * system.h
  * ----------------------------------------------------------------------------
- * System clock (HSE), SysTick millisecond timebase, watchdog, and delays.
+ * System clock, SysTick millisecond timebase, watchdog, and delays.
+ * The MCU runs on its default internal 16 MHz HSI oscillator.
  * ----------------------------------------------------------------------------
  */
 #ifndef SYSTEM_H
@@ -9,10 +10,11 @@
 
 #include "stm32f4xx.h"
 
-/* Initialize external 8 MHz oscillator as system clock */
-void HSE_Init(void);
+/* Clock setup. The MCU already runs on the 16 MHz HSI at reset, so this is
+ * an explicit no-op kept for clarity. Call it first in main(). */
+void Clock_Init(void);
 
-/* Configure SysTick for a 1 ms interrupt tick. Call after HSE_Init(). */
+/* Configure SysTick for a 1 ms interrupt tick. Call after Clock_Init(). */
 void SysTick_Init(void);
 
 /* Free-running millisecond counter since SysTick_Init(). */
